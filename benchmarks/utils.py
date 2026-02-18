@@ -32,8 +32,10 @@ def build_save_folder_name(
     alpha_value: float,
     k_reranker: int,
     instruction: str | None,
+    diversify_strategy: str | None = None,
+    diversify_weight: float | None = None,
 ) -> str:
-    """Build the folder name based on the model names, BM25 flag, alpha value, k_reranker, and instruction."""
+    """Build the folder name based on the model names, BM25 flag, alpha value, k_reranker, instruction, and diversification."""
     encoder_part = encoder_model.split("/")[-1].replace("_", "-") if encoder_model else ""
     bm25_part = "bm25" if use_bm25 else ""
     reranker_part = reranker_model.split("/")[-1].replace("_", "-") if reranker_model else ""
@@ -41,6 +43,8 @@ def build_save_folder_name(
     base_name = "_".join(parts)
     if instruction:
         base_name += "_instruction"
+    if diversify_strategy:
+        base_name += f"_div-{diversify_strategy}-{diversify_weight}"
     return f"{base_name}_alpha{alpha_value}_kr{k_reranker}"
 
 

@@ -10,7 +10,8 @@ dependencies = [
     "vicinity",
     "sentence-transformers",
     "transformers<4.47.0",
-    "bm25s"
+    "bm25s",
+    "pyversity"
 ]
 
 

@@ -6,11 +6,12 @@ from typing import Any, DefaultDict
 
 import bm25s
 import numpy as np
+from pyversity import Strategy, diversify
 from sentence_transformers import CrossEncoder
 from vicinity import Backend, Metric, Vicinity
 
 from korok.datatypes import DenseResult, Document, HybridResult, QueryResult, SparseResult
-from korok.utils import Encoder, convert_distances_to_similarities, normalize_scores
+from korok.utils import Encoder, convert_distances_to_similarities, normalize_scores, safe_encode
 
 
 class Pipeline:
@@ -91,7 +92,7 @@ class Pipeline:
         # Build a dense vector index using the encoder
         dense_index = None
         if encoder is not None:
-            vectors = encoder.encode(texts, show_progressbar=True)
+            vectors = safe_encode(encoder, texts, show_progressbar=True)
             dense_index = Vicinity.from_vectors_and_items(
                 vectors=vectors,
                 items=texts,
@@ -167,7 +168,15 @@ class Pipeline:
 
         return results
 
-    def query(self, texts: list[str], k: int = 10, k_reranker: int = 30, instruction: str | None = None) -> QueryResult:
+    def query(  # noqa C901
+        self,
+        texts: list[str],
+        k: int = 10,
+        k_reranker: int = 30,
+        instruction: str | None = None,
+        diversify_strategy: Strategy | str | None = None,
+        diversify_weight: float = 0.5,
+    ) -> QueryResult:
         """
         Query the pipeline.
 
@@ -176,11 +185,14 @@ class Pipeline:
           - Dense search if we have only have a dense index.
           - Sparse search if we have only a sparse index.
           - Reranking if a reranker is provided.
+          - Diversification if a diversify_strategy is provided.
 
         :param texts: The list of texts to query.
         :param k: The number of results to return.
         :param k_reranker: The number of results to consider for reranking.
         :param instruction: An optional instruction to add to the query (for dense retrieval).
+        :param diversify_strategy: Optional diversification strategy (e.g., 'mmr', 'dpp', 'msd').
+        :param diversify_weight: Diversity weight (0-1). Higher values prioritize diversity.
         :return: The search results.
         """
         # Compute dense results if both dense index and encoder are available
@@ -188,9 +200,9 @@ class Pipeline:
         if self.dense_index and self.encoder:
             # If an instruction is provided, combine it with each query for dense retrieval.
             if instruction:
-                vectors = self.encoder.encode([f"{instruction} {text}" for text in texts], show_progressbar=True)
+                vectors = safe_encode(self.encoder, [f"{instruction} {text}" for text in texts], show_progressbar=True)
             else:
-                vectors = self.encoder.encode(texts, show_progressbar=True)
+                vectors = safe_encode(self.encoder, texts, show_progressbar=True)
             dense_results = self.dense_index.query(vectors, k_reranker)
             # Convert distances to similarities
             dense_results = convert_distances_to_similarities(dense_results, self.distance_metric)
@@ -232,6 +244,34 @@ class Pipeline:
                 reranked_result = [(str(item["text"]), float(item["score"])) for item in reranked_documents]
                 reranked_results.append(reranked_result)
             results = reranked_results
+
+        # Diversify the results if a strategy is provided
+        if diversify_strategy is not None and self.encoder is not None:
+            diversified_results = []
+            for row in results:
+                # Need at least 2 candidates to diversify
+                if len(row) < 2:
+                    diversified_results.append(row)
+                    continue
+                # Extract documents and scores
+                docs = [doc for doc, _ in row]
+                scores = np.array([score for _, score in row])
+                # Encode documents for diversification
+                embeddings = safe_encode(self.encoder, docs, show_progressbar=False)
+                # Select min(k, len(docs)) items via diversification
+                div_k = min(k, len(docs))
+                # Apply diversification
+                div_result = diversify(
+                    embeddings=embeddings,
+                    scores=scores,
+                    k=div_k,
+                    strategy=diversify_strategy,
+                    diversity=diversify_weight,
+                )
+                # Reorder results based on diversified indices
+                diversified_row = [(docs[i], div_result.selection_scores[j]) for j, i in enumerate(div_result.indices)]
+                diversified_results.append(diversified_row)
+            results = diversified_results
 
         # Convert outputs and return the top k results
         results = [[(str(doc), float(score)) for doc, score in row][:k] for row in results]

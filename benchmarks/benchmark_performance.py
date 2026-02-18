@@ -11,10 +11,30 @@ from sentence_transformers import CrossEncoder
 
 from benchmarks.utils import build_save_folder_name, initialize_models, save_json
 from korok import Pipeline
-from korok.utils import Encoder
+from korok.utils import Encoder, safe_encode
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def ilad(embeddings: np.ndarray) -> float:
+    """Compute Intra-List Average Distance (average pairwise dissimilarity)."""
+    if len(embeddings) < 2:
+        return 0.0
+    sims = embeddings @ embeddings.T
+    num_items = len(embeddings)
+    mask = np.triu(np.ones((num_items, num_items), dtype=bool), k=1)
+    return float(np.mean(1.0 - sims[mask]))
+
+
+def ilmd(embeddings: np.ndarray) -> float:
+    """Compute Intra-List Minimum Distance (minimum pairwise dissimilarity)."""
+    if len(embeddings) < 2:
+        return 0.0
+    sims = embeddings @ embeddings.T
+    num_items = len(embeddings)
+    mask = np.triu(np.ones((num_items, num_items), dtype=bool), k=1)
+    return float(np.min(1.0 - sims[mask]))
 
 
 def load_and_prepare_dataset(
@@ -58,27 +78,40 @@ def retrieve_query_results(
     k: int,
     k_reranker: int,
     instruction: str | None = None,
-) -> tuple[list[list[str]], list[list[float]], list[str]]:
+    diversify_strategy: str | None = None,
+    diversify_weight: float = 0.5,
+) -> tuple[list[list[str]], list[list[float]], list[str], list[list[str]]]:
     """Retrieve ranked document IDs and scores for each query."""
     all_ranked_results: list[list[str]] = []
     all_scores: list[list[float]] = []
+    all_doc_texts: list[list[str]] = []
     query_ids: list[str] = []
     for qid, qtext in queries.items():
-        hybrid_results = pipeline.query([qtext], k=k, k_reranker=k_reranker, instruction=instruction)[0]
+        hybrid_results = pipeline.query(
+            [qtext],
+            k=k,
+            k_reranker=k_reranker,
+            instruction=instruction,
+            diversify_strategy=diversify_strategy,
+            diversify_weight=diversify_weight,
+        )[0]
         ranked_doc_ids: list[str] = []
         scores: list[float] = []
+        doc_texts: list[str] = []
         for doc_text, score in hybrid_results:
             doc_id = doc_text_to_id.get(doc_text)
             if doc_id:
                 ranked_doc_ids.append(doc_id)
                 scores.append(score)
+                doc_texts.append(doc_text)
         if ranked_doc_ids:
             all_ranked_results.append(ranked_doc_ids)
             all_scores.append(scores)
+            all_doc_texts.append(doc_texts)
             query_ids.append(qid)
         else:
             logger.warning(f"No results retrieved for query {qid}")
-    return all_ranked_results, all_scores, query_ids
+    return all_ranked_results, all_scores, query_ids, all_doc_texts
 
 
 def evaluate_results(
@@ -107,6 +140,8 @@ def process_dataset(
     instruction: str | None,
     output_dir: Path,
     k_values: list[int],
+    diversify_strategy: str | None = None,
+    diversify_weight: float = 0.5,
 ) -> tuple[dict[str, Any] | None, float, float, int]:
     """Process a single dataset: load data, build pipeline, query and evaluate results, and save the results to a file."""
     try:
@@ -119,8 +154,15 @@ def process_dataset(
         fit_time = time.perf_counter() - fit_start
         logger.info(f"Pipeline fitted in {fit_time:.4f} seconds.")
         query_start = time.perf_counter()
-        all_ranked_results, all_scores, query_ids = retrieve_query_results(
-            pipeline, queries, doc_text_to_id, k, k_reranker, instruction
+        all_ranked_results, all_scores, query_ids, all_doc_texts = retrieve_query_results(
+            pipeline,
+            queries,
+            doc_text_to_id,
+            k,
+            k_reranker,
+            instruction,
+            diversify_strategy,
+            diversify_weight,
         )
         query_time = time.perf_counter() - query_start
         logger.info(f"Retrieved results for {len(query_ids)} queries in {query_time:.4f} seconds.")
@@ -128,6 +170,29 @@ def process_dataset(
         metrics = evaluate_results(qrels, all_ranked_results, all_scores, query_ids, k_values)
         metrics["qps"] = qps
         metrics["pipeline_fit_time"] = fit_time
+
+        # Compute diversity metrics (ILAD and ILMD) if encoder is available
+        if encoder is not None:
+            diversity_metrics: dict[str, dict[str, float]] = {"ilad": {}, "ilmd": {}}
+            for k_val in k_values:
+                ilad_scores = []
+                ilmd_scores = []
+                for doc_texts in all_doc_texts:
+                    top_k_docs = doc_texts[:k_val]
+                    if len(top_k_docs) >= 2:
+                        embs = safe_encode(encoder, top_k_docs, show_progressbar=False)
+                        # Normalize embeddings for cosine similarity
+                        embs = embs / np.linalg.norm(embs, axis=1, keepdims=True)
+                        ilad_scores.append(ilad(embs))
+                        ilmd_scores.append(ilmd(embs))
+                diversity_metrics["ilad"][f"ILAD@{k_val}"] = float(np.mean(ilad_scores)) if ilad_scores else 0.0
+                diversity_metrics["ilmd"][f"ILMD@{k_val}"] = float(np.mean(ilmd_scores)) if ilmd_scores else 0.0
+            metrics["ilad"] = diversity_metrics["ilad"]
+            metrics["ilmd"] = diversity_metrics["ilmd"]
+            logger.info(
+                f"Diversity metrics - ILAD@10: {metrics['ilad'].get('ILAD@10', 0):.4f}, ILMD@10: {metrics['ilmd'].get('ILMD@10', 0):.4f}"
+            )
+
         results_path = output_dir / f"{ds_name}_results.json"
         save_json(metrics, results_path)
         logger.info(f"Saved results for {ds_name} to {results_path}")
@@ -147,6 +212,8 @@ def main(
     instruction: str | None,
     overwrite_results: bool,
     device: str | None,
+    diversify_strategy: str | None = None,
+    diversify_weight: float = 0.5,
 ) -> None:
     """Evaluate a retrieval pipeline on multiple NanoBEIR datasets."""
     dataset_name_to_id: dict[str, str] = {
@@ -165,7 +232,16 @@ def main(
         "touche2020": "zeta-alpha-ai/NanoTouche2020",
     }
     encoder, reranker = initialize_models(encoder_model, reranker_model, device)
-    save_folder = build_save_folder_name(encoder_model, use_bm25, reranker_model, alpha_value, k_reranker, instruction)
+    save_folder = build_save_folder_name(
+        encoder_model,
+        use_bm25,
+        reranker_model,
+        alpha_value,
+        k_reranker,
+        instruction,
+        diversify_strategy,
+        diversify_weight,
+    )
     output_dir = Path(save_path) / save_folder
     if output_dir.exists() and not overwrite_results:
         logger.info(f"Output folder '{output_dir}' already exists and overwrite_results is False. Skipping evaluation.")
@@ -183,6 +259,8 @@ def main(
         "device": device,
         "output_dir": str(output_dir),
         "dataset_name_to_id": dataset_name_to_id,
+        "diversify_strategy": diversify_strategy,
+        "diversify_weight": diversify_weight,
     }
     config_path = output_dir / "config.json"
     save_json(config, config_path)
@@ -205,6 +283,8 @@ def main(
             instruction,
             output_dir,
             k_values,
+            diversify_strategy,
+            diversify_weight,
         )
         if metrics is not None:
             all_metrics[ds_name] = metrics
@@ -215,7 +295,7 @@ def main(
     overall_qps = total_queries / total_query_time if total_query_time > 0 else 0.0
     avg_fit_time = total_fit_time / dataset_count if dataset_count > 0 else 0.0
     aggregated_scores: dict[str, dict[str, float]] = {}
-    for mtype in ["ndcg", "map", "recall", "precision"]:
+    for mtype in ["ndcg", "map", "recall", "precision", "ilad", "ilmd"]:
         sums: dict[str, float] = {}
         counts: dict[str, int] = {}
         for ds_metrics in all_metrics.values():
@@ -274,6 +354,19 @@ if __name__ == "__main__":
         help="If set, overwrite results even if the save folder already exists.",
     )
     parser.add_argument("--device", type=str, default=None, help="Device to use for inference.")
+    parser.add_argument(
+        "--diversify-strategy",
+        type=str,
+        default=None,
+        choices=["mmr", "dpp", "msd", "cover", "ssd"],
+        help="Diversification strategy to apply (e.g., 'mmr', 'dpp').",
+    )
+    parser.add_argument(
+        "--diversify-weight",
+        type=float,
+        default=0.5,
+        help="Diversity weight (0-1). Higher values prioritize diversity.",
+    )
     args = parser.parse_args()
     main(
         encoder_model=args.encoder_model,
@@ -285,4 +378,6 @@ if __name__ == "__main__":
         instruction=args.instruction,
         overwrite_results=args.overwrite_results,
         device=args.device,
+        diversify_strategy=args.diversify_strategy,
+        diversify_weight=args.diversify_weight,
     )
