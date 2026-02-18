@@ -10,13 +10,14 @@ from sentence_transformers import CrossEncoder
 from vicinity import Backend, Metric, Vicinity
 
 from korok.datatypes import DenseResult, Document, HybridResult, QueryResult, SparseResult
-from korok.utils import Encoder, convert_distances_to_similarities, normalize_scores
+from korok.utils import Encoder, convert_distances_to_similarities, normalize_scores, safe_encode
 
 
 class Pipeline:
     def __init__(
         self,
         encoder: Encoder | None = None,
+        query_encoder: Encoder | None = None,
         dense_index: Vicinity | None = None,
         sparse_index: bm25s.BM25 | None = None,
         reranker: CrossEncoder | None = None,
@@ -28,7 +29,8 @@ class Pipeline:
         """
         Initialize a Pipeline instance.
 
-        :param encoder: An encoder for dense vector search.
+        :param encoder: An encoder for dense vector search (used for indexing).
+        :param query_encoder: An optional separate encoder for queries (e.g., NIFE). Falls back to encoder if not set.
         :param dense_index: A dense vector index using the provided encoder.
         :param sparse_index: A sparse vector index using BM25.
         :param reranker: A cross-encoder reranker.
@@ -38,6 +40,7 @@ class Pipeline:
         :param stopwords: Stopwords for BM25 tokenization.
         """
         self.encoder = encoder
+        self.query_encoder = query_encoder or encoder
         self.dense_index = dense_index
         self.sparse_index = sparse_index
         self.reranker = reranker
@@ -51,6 +54,7 @@ class Pipeline:
         cls,
         texts: list[str],
         encoder: Encoder | None = None,
+        query_encoder: Encoder | None = None,
         use_bm25: bool = False,
         reranker: CrossEncoder | None = None,
         backend_type: Backend = Backend.BASIC,
@@ -68,7 +72,8 @@ class Pipeline:
         - If a reranker is provided, rerank the results for each query.
 
         :param texts: The corpus of documents to index.
-        :param encoder: An encoder for dense vector search.
+        :param encoder: An encoder for dense vector search (used for indexing).
+        :param query_encoder: An optional separate encoder for queries. Falls back to encoder if not set.
         :param use_bm25: A bool indicating whether to build a BM25 index for sparse vector search.
         :param reranker: A cross-encoder reranker.
         :param backend_type: The backend type for the dense vector index.
@@ -91,7 +96,7 @@ class Pipeline:
         # Build a dense vector index using the encoder
         dense_index = None
         if encoder is not None:
-            vectors = encoder.encode(texts, show_progressbar=True)
+            vectors = safe_encode(encoder, texts, show_progressbar=True)
             dense_index = Vicinity.from_vectors_and_items(
                 vectors=vectors,
                 items=texts,
@@ -117,6 +122,7 @@ class Pipeline:
 
         return cls(
             encoder=encoder,
+            query_encoder=query_encoder,
             dense_index=dense_index,
             sparse_index=sparse_index,
             reranker=reranker,
@@ -183,14 +189,16 @@ class Pipeline:
         :param instruction: An optional instruction to add to the query (for dense retrieval).
         :return: The search results.
         """
-        # Compute dense results if both dense index and encoder are available
+        # Compute dense results if both dense index and query encoder are available
         dense_results = None
-        if self.dense_index and self.encoder:
+        if self.dense_index and self.query_encoder:
             # If an instruction is provided, combine it with each query for dense retrieval.
             if instruction:
-                vectors = self.encoder.encode([f"{instruction} {text}" for text in texts], show_progressbar=True)
+                vectors = safe_encode(
+                    self.query_encoder, [f"{instruction} {text}" for text in texts], show_progressbar=True
+                )
             else:
-                vectors = self.encoder.encode(texts, show_progressbar=True)
+                vectors = safe_encode(self.query_encoder, texts, show_progressbar=True)
             dense_results = self.dense_index.query(vectors, k_reranker)
             # Convert distances to similarities
             dense_results = convert_distances_to_similarities(dense_results, self.distance_metric)

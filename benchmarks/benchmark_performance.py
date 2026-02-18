@@ -44,10 +44,16 @@ def build_hybrid_pipeline(
     reranker: CrossEncoder | None,
     alpha_value: float,
     use_bm25: bool,
+    query_encoder: Encoder | None = None,
 ) -> Pipeline:
     """Build and return a retrieval pipeline."""
     return Pipeline.fit(
-        texts=ordered_corpus_texts, encoder=encoder, use_bm25=use_bm25, reranker=reranker, alpha=alpha_value
+        texts=ordered_corpus_texts,
+        encoder=encoder,
+        query_encoder=query_encoder,
+        use_bm25=use_bm25,
+        reranker=reranker,
+        alpha=alpha_value,
     )
 
 
@@ -107,6 +113,7 @@ def process_dataset(
     instruction: str | None,
     output_dir: Path,
     k_values: list[int],
+    query_encoder: Encoder | None = None,
 ) -> tuple[dict[str, Any] | None, float, float, int]:
     """Process a single dataset: load data, build pipeline, query and evaluate results, and save the results to a file."""
     try:
@@ -115,7 +122,7 @@ def process_dataset(
         logger.info(f"Loaded corpus with {len(corpus)} documents and {len(queries)} queries.")
         k = len(ordered_texts)
         fit_start = time.perf_counter()
-        pipeline = build_hybrid_pipeline(ordered_texts, encoder, reranker, alpha_value, use_bm25)
+        pipeline = build_hybrid_pipeline(ordered_texts, encoder, reranker, alpha_value, use_bm25, query_encoder)
         fit_time = time.perf_counter() - fit_start
         logger.info(f"Pipeline fitted in {fit_time:.4f} seconds.")
         query_start = time.perf_counter()
@@ -147,6 +154,7 @@ def main(
     instruction: str | None,
     overwrite_results: bool,
     device: str | None,
+    query_encoder_model: str | None = None,
 ) -> None:
     """Evaluate a retrieval pipeline on multiple NanoBEIR datasets."""
     dataset_name_to_id: dict[str, str] = {
@@ -164,8 +172,10 @@ def main(
         "scifact": "zeta-alpha-ai/NanoSciFact",
         "touche2020": "zeta-alpha-ai/NanoTouche2020",
     }
-    encoder, reranker = initialize_models(encoder_model, reranker_model, device)
-    save_folder = build_save_folder_name(encoder_model, use_bm25, reranker_model, alpha_value, k_reranker, instruction)
+    encoder, reranker, query_encoder = initialize_models(encoder_model, reranker_model, device, query_encoder_model)
+    save_folder = build_save_folder_name(
+        encoder_model, use_bm25, reranker_model, alpha_value, k_reranker, instruction, query_encoder_model
+    )
     output_dir = Path(save_path) / save_folder
     if output_dir.exists() and not overwrite_results:
         logger.info(f"Output folder '{output_dir}' already exists and overwrite_results is False. Skipping evaluation.")
@@ -174,6 +184,7 @@ def main(
     logger.info(f"Saving results to folder: {output_dir}")
     config = {
         "encoder_model": encoder_model,
+        "query_encoder_model": query_encoder_model,
         "reranker_model": reranker_model,
         "alpha_value": alpha_value,
         "k_reranker": k_reranker,
@@ -205,6 +216,7 @@ def main(
             instruction,
             output_dir,
             k_values,
+            query_encoder,
         )
         if metrics is not None:
             all_metrics[ds_name] = metrics
@@ -274,6 +286,12 @@ if __name__ == "__main__":
         help="If set, overwrite results even if the save folder already exists.",
     )
     parser.add_argument("--device", type=str, default=None, help="Device to use for inference.")
+    parser.add_argument(
+        "--query-encoder-model",
+        type=str,
+        default=None,
+        help="Optional separate query encoder (e.g., 'stephantulkens/NIFE-mxbai-embed-large-v1'). Uses encoder-model for queries if not set.",
+    )
     args = parser.parse_args()
     main(
         encoder_model=args.encoder_model,
@@ -285,4 +303,5 @@ if __name__ == "__main__":
         instruction=args.instruction,
         overwrite_results=args.overwrite_results,
         device=args.device,
+        query_encoder_model=args.query_encoder_model,
     )

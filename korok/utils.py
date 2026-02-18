@@ -24,6 +24,14 @@ class Encoder(Protocol):
         ...  # pragma: no cover
 
 
+def safe_encode(encoder: Encoder, texts: list[str] | str | Sequence[str], show_progressbar: bool = True) -> np.ndarray:
+    """Safely encode texts, handling encoders that don't support show_progressbar."""
+    try:
+        return encoder.encode(texts, show_progressbar=show_progressbar)
+    except (TypeError, ValueError):
+        return encoder.encode(texts)
+
+
 def normalize_scores(scores: np.ndarray) -> np.ndarray:
     """Min-max normalize row-wise."""
     min_vals = np.min(scores, axis=-1, keepdims=True)
